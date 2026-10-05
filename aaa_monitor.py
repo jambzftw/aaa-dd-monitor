@@ -68,12 +68,18 @@ def discover():
           "of it to the 'watch' command.")
 
 
-def notify(msg):
+def notify(msg, title=None, priority=None):
     print(msg)
     topic = os.environ.get("NTFY_TOPIC")
     if topic:
+        headers = {}
+        if title:
+            headers["Title"] = title
+        if priority:
+            headers["Priority"] = priority
         try:
-            requests.post(f"https://ntfy.sh/{topic}", data=msg.encode("utf-8"), timeout=10)
+            requests.post(f"https://ntfy.sh/{topic}", data=msg.encode("utf-8"),
+                          headers=headers, timeout=10)
         except Exception as e:
             print(f"ntfy failed: {e}")
 
@@ -210,20 +216,24 @@ def parse_slots(bodies, site_names):
     for body in bodies:
         if not isinstance(body, dict):
             continue
-        attrs = {a["id"]: a["name"]["text"]
-                 for a in (body.get("relatedData") or {}).get("attributes", [])}
+        related = body.get("relatedData") or {}
+        attrs = {a["id"]: a["name"]["text"] for a in related.get("attributes", [])}
+        screens = {s["id"]: s["name"]["text"] for s in related.get("screens", [])}
         for st in body.get("showtimes", []):
             if st.get("filmId") not in (None, FILM_ID):
                 continue
-            starts = (st.get("schedule") or {}).get("startsAt") or st.get("startsAt") or ""
+            sched = st.get("schedule") or {}
+            starts = sched.get("startsAt") or st.get("startsAt") or ""
             if len(starts) < 16:
                 continue
             sid = st.get("siteId")
             slots[st.get("id") or f"{sid}-{starts}"] = {
                 "site_id": sid,
                 "site": SITE_LABELS.get(sid) or site_names.get(sid, sid),
-                "date": starts[:10],
+                "screen": screens.get(st.get("screenId"), ""),
+                "date": sched.get("businessDate") or starts[:10],
                 "time": starts[11:16],
+                "sold_out": bool(st.get("isSoldOut")),
                 "formats": ", ".join(attrs.get(a, a) for a in st.get("attributeIds", [])),
             }
     return slots
@@ -237,8 +247,10 @@ def wanted(slots):
 
 
 def fmt_slot(s):
+    screen = f" {s['screen']}" if s.get("screen") else ""
     extra = f" ({s['formats']})" if s["formats"] else ""
-    return f"{s['date'][5:]} {s['time']} {s['site']}{extra}"
+    tag = " [SOLD OUT]" if s.get("sold_out") else ""
+    return f"{s['date'][5:]} {s['time']} {s['site']}{screen}{extra}{tag}"
 
 
 def slots_cmd():
@@ -268,21 +280,56 @@ def check_slots():
     hits = wanted(parse_slots(bodies, site_names))
     state = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {}
     prev = state.get("slots")
+    if isinstance(prev, list):            # oldest state format: ids only
+        prev = {k: {"sold_out": False, "label": k} for k in prev}
+    elif isinstance(prev, dict):          # tolerate {id: bool} from the previous version
+        prev = {k: (v if isinstance(v, dict) else {"sold_out": bool(v), "label": k})
+                for k, v in prev.items()}
     ordered = sorted(hits.items(), key=lambda kv: (kv[1]["date"], kv[1]["time"], str(kv[1]["site"])))
+    # If a date's response is missing this run, don't treat its slots as removed.
+    got_dates = {b.get("businessDate") for b in bodies if isinstance(b, dict)}
+    complete = set(TARGET_DATES) <= got_dates
+
     if prev is None:
         print(f"Baseline saved: {len(hits)} matching slots.")
         if hits:
-            notify(f"Ayala All Access: {len(hits)} evening slots already open for "
-                   f"Avengers: Doomsday on {', '.join(TARGET_DATES)}:\n"
-                   + "\n".join(fmt_slot(v) for _, v in ordered[:10]))
+            open_n = sum(1 for v in hits.values() if not v["sold_out"])
+            notify(f"Starting list: {len(hits)} evening slots for Avengers: Doomsday "
+                   f"on {', '.join(TARGET_DATES)} ({open_n} with seats). "
+                   "You'll be alerted when this changes.\n"
+                   + "\n".join(fmt_slot(v) for _, v in ordered[:10]) + f"\n{FILM_URL}",
+                   title="AAA monitor started")
     else:
-        new = [(k, v) for k, v in ordered if k not in set(prev)]
+        new = [(k, v) for k, v in ordered if k not in prev]
+        reopened = [(k, v) for k, v in ordered
+                    if k in prev and prev[k]["sold_out"] and not v["sold_out"]]
+        soldout = ([(k, v) for k, v in ordered
+                    if k in prev and not prev[k]["sold_out"] and v["sold_out"]]
+                   if os.environ.get("AAA_ALERT_SOLDOUT") else [])
+        gone = [prev[k]["label"] for k in prev if k not in hits] if complete else []
+
+        lines = []
         if new:
-            notify(f"Ayala All Access: {len(new)} new evening slot(s) for Avengers: Doomsday:\n"
-                   + "\n".join(fmt_slot(v) for _, v in new[:10]) + f"\n{FILM_URL}")
+            lines += ["NEW SLOT(S):"] + [fmt_slot(v) for _, v in new[:10]]
+        if reopened:
+            lines += ["SEATS OPENED UP:"] + [fmt_slot(v) for _, v in reopened[:10]]
+        if soldout:
+            lines += ["JUST SOLD OUT:"] + [fmt_slot(v) for _, v in soldout[:10]]
+        if gone:
+            lines += ["REMOVED:"] + gone[:10]
+        if lines:
+            urgent = bool(new or reopened)
+            notify("\n".join(lines) + f"\n{FILM_URL}",
+                   title="Avengers: Doomsday - new slot" if new else "Avengers: Doomsday - schedule change",
+                   priority="high" if urgent else None)
         else:
-            print("No new slots.")
-    state["slots"] = sorted(hits)
+            print("No changes.")
+
+    state["slots"] = {k: {"sold_out": v["sold_out"], "label": fmt_slot(v).replace(" [SOLD OUT]", "")}
+                      for k, v in hits.items()}
+    if not complete and prev:             # keep old entries for dates that didn't come back
+        for k, v in prev.items():
+            state["slots"].setdefault(k, v)
     json.dump(state, open(STATE_FILE, "w"))
 
 
