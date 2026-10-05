@@ -15,7 +15,9 @@ Step 2 - watch it (use a URL fragment from the discover output):
 Optional alerts: set NTFY_TOPIC (https://ntfy.sh) and you get a phone push on changes.
 """
 import argparse
+import datetime as dt
 import hashlib
+import re
 import json
 import os
 import sys
@@ -68,15 +70,17 @@ def discover():
           "of it to the 'watch' command.")
 
 
-def notify(msg, title=None, priority=None):
+def notify(msg, title=None, priority=None, tags=None):
     print(msg)
     topic = os.environ.get("NTFY_TOPIC")
     if topic:
-        headers = {}
+        headers = {"Click": FILM_URL}      # tapping the notification opens the film page
         if title:
             headers["Title"] = title
         if priority:
             headers["Priority"] = priority
+        if tags:
+            headers["Tags"] = tags         # ntfy turns these into emoji, e.g. "tada"
         try:
             requests.post(f"https://ntfy.sh/{topic}", data=msg.encode("utf-8"),
                           headers=headers, timeout=10)
@@ -234,7 +238,10 @@ def parse_slots(bodies, site_names):
                 "date": sched.get("businessDate") or starts[:10],
                 "time": starts[11:16],
                 "sold_out": bool(st.get("isSoldOut")),
-                "formats": ", ".join(attrs.get(a, a) for a in st.get("attributeIds", [])),
+                # Drop internal screen codes like C1/C5; keep formats (2D, 4DX, ATMOS, ...)
+                "formats": ", ".join(
+                    n for n in (attrs.get(a, a) for a in st.get("attributeIds", []))
+                    if not re.fullmatch(r"C\d+", n)),
             }
     return slots
 
@@ -246,11 +253,39 @@ def wanted(slots):
             and v["date"] in TARGET_DATES and v["time"] >= EVENING_FROM}
 
 
-def fmt_slot(s):
-    screen = f" {s['screen']}" if s.get("screen") else ""
-    extra = f" ({s['formats']})" if s["formats"] else ""
-    tag = " [SOLD OUT]" if s.get("sold_out") else ""
-    return f"{s['date'][5:]} {s['time']} {s['site']}{screen}{extra}{tag}"
+def fmt_date(d):
+    x = dt.date.fromisoformat(d)
+    return f"{x.strftime('%a %b')} {x.day}"            # e.g. "Fri Dec 18"
+
+
+def fmt_time(t):
+    h, m = int(t[:2]), t[3:5]
+    return f"{h % 12 or 12}:{m} {'AM' if h < 12 else 'PM'}"   # e.g. "7:00 PM"
+
+
+def fmt_line(s, tag=True):
+    screen = re.sub(r"^\w+\s+(?=Cinema)", "", s.get("screen") or "")   # "GL Cinema 5" -> "Cinema 5"
+    where = ", ".join(x for x in (s["site"], screen) if x)
+    extra = f" · {s['formats']}" if s["formats"] else ""
+    sold = "  [SOLD OUT]" if tag and s.get("sold_out") else ""
+    return f"{fmt_time(s['time'])}  {where}{extra}{sold}"
+
+
+def fmt_slot(s, tag=True):
+    return f"{fmt_date(s['date'])}  {fmt_line(s, tag)}"
+
+
+def fmt_groups(slots):
+    """Slots grouped under a date heading, one line per slot."""
+    out, cur = [], None
+    for s in slots:
+        if s["date"] != cur:
+            if cur is not None:
+                out.append("")
+            cur = s["date"]
+            out.append(fmt_date(cur))
+        out.append("  " + fmt_line(s))
+    return out
 
 
 def slots_cmd():
@@ -294,11 +329,10 @@ def check_slots():
         print(f"Baseline saved: {len(hits)} matching slots.")
         if hits:
             open_n = sum(1 for v in hits.values() if not v["sold_out"])
-            notify(f"Starting list: {len(hits)} evening slots for Avengers: Doomsday "
-                   f"on {', '.join(TARGET_DATES)} ({open_n} with seats). "
-                   "You'll be alerted when this changes.\n"
-                   + "\n".join(fmt_slot(v) for _, v in ordered[:10]) + f"\n{FILM_URL}",
-                   title="AAA monitor started")
+            notify(f"{len(hits)} evening slots listed, {open_n} with seats. "
+                   "You'll be alerted when this changes.\n\n"
+                   + "\n".join(fmt_groups([v for _, v in ordered])),
+                   title="Avengers: Doomsday monitor started", tags="movie_camera")
     else:
         new = [(k, v) for k, v in ordered if k not in prev]
         reopened = [(k, v) for k, v in ordered
@@ -309,23 +343,32 @@ def check_slots():
         gone = [prev[k]["label"] for k in prev if k not in hits] if complete else []
 
         lines = []
+
+        def section(head, body):
+            if lines:
+                lines.append("")
+            lines.append(head)
+            lines.extend(body)
+
         if new:
-            lines += ["NEW SLOT(S):"] + [fmt_slot(v) for _, v in new[:10]]
+            section("NEW SLOT" + ("S" if len(new) > 1 else ""),
+                    fmt_groups([v for _, v in new[:10]]))
         if reopened:
-            lines += ["SEATS OPENED UP:"] + [fmt_slot(v) for _, v in reopened[:10]]
+            section("SEATS OPENED UP", fmt_groups([v for _, v in reopened[:10]]))
         if soldout:
-            lines += ["JUST SOLD OUT:"] + [fmt_slot(v) for _, v in soldout[:10]]
+            section("JUST SOLD OUT", fmt_groups([v for _, v in soldout[:10]]))
         if gone:
-            lines += ["REMOVED:"] + gone[:10]
+            section("REMOVED", [f"  {g}" for g in gone[:10]])
         if lines:
             urgent = bool(new or reopened)
-            notify("\n".join(lines) + f"\n{FILM_URL}",
+            notify("\n".join(lines),
                    title="Avengers: Doomsday - new slot" if new else "Avengers: Doomsday - schedule change",
-                   priority="high" if urgent else None)
+                   priority="high" if urgent else None,
+                   tags="tada" if new else ("ticket" if reopened else "warning"))
         else:
             print("No changes.")
 
-    state["slots"] = {k: {"sold_out": v["sold_out"], "label": fmt_slot(v).replace(" [SOLD OUT]", "")}
+    state["slots"] = {k: {"sold_out": v["sold_out"], "label": fmt_slot(v, tag=False)}
                       for k, v in hits.items()}
     if not complete and prev:             # keep old entries for dates that didn't come back
         for k, v in prev.items():
