@@ -26,6 +26,7 @@ jobs:
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
       AAA_DATES: ${{ vars.AAA_DATES }}                 # optional, default 2026-12-18,2026-12-19
       AAA_EVENING_FROM: ${{ vars.AAA_EVENING_FROM }}   # optional, default 17:00
+      AAA_ALERT_SOLDOUT: ${{ vars.AAA_ALERT_SOLDOUT }} # optional, set to 1 to also alert when a slot sells out
       AAA_SITES: ${{ vars.AAA_SITES }}                 # optional, default 1001,1003,1020 (Glorietta, Greenbelt, Circuit)
     steps:
       - uses: actions/checkout@v4
