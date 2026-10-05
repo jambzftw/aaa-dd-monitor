@@ -149,6 +149,10 @@ FILM_ID = "HO00000111"
 TARGET_DATES = [d.strip() for d in
                 (os.environ.get("AAA_DATES") or "2026-12-18,2026-12-19").split(",") if d.strip()]
 EVENING_FROM = os.environ.get("AAA_EVENING_FROM") or "17:00"   # HH:MM, local cinema time
+# Cinema site IDs (from the site's /sites list): Glorietta, Greenbelt, Ayala Malls Circuit (Makati)
+TARGET_SITES = [s.strip() for s in
+                (os.environ.get("AAA_SITES") or "1001,1003,1020").split(",") if s.strip()]
+SITE_LABELS = {"1001": "Glorietta", "1003": "Greenbelt", "1020": "Circuit Makati"}
 SKIP_HEADERS = {"host", "content-length", "connection", "accept-encoding", "cookie"}
 
 
@@ -180,7 +184,7 @@ def fetch_showtimes():
         page.goto(FILM_URL, wait_until="networkidle")
         page.wait_for_timeout(5000)
 
-        ids = list(site_names)
+        ids = TARGET_SITES
         for date in TARGET_DATES:
             base = f"{API}/showtimes/by-business-date/{date}?filmIds={FILM_ID}"
             resp = ctx.request.get(base + "".join(f"&siteIds={i}" for i in ids),
@@ -216,7 +220,8 @@ def parse_slots(bodies, site_names):
                 continue
             sid = st.get("siteId")
             slots[st.get("id") or f"{sid}-{starts}"] = {
-                "site": site_names.get(sid, sid),
+                "site_id": sid,
+                "site": SITE_LABELS.get(sid) or site_names.get(sid, sid),
                 "date": starts[:10],
                 "time": starts[11:16],
                 "formats": ", ".join(attrs.get(a, a) for a in st.get("attributeIds", [])),
@@ -225,9 +230,10 @@ def parse_slots(bodies, site_names):
 
 
 def wanted(slots):
-    """Keep only target dates, evening start times."""
+    """Keep only target cinemas, target dates, evening start times."""
     return {k: v for k, v in slots.items()
-            if v["date"] in TARGET_DATES and v["time"] >= EVENING_FROM}
+            if v["site_id"] in TARGET_SITES
+            and v["date"] in TARGET_DATES and v["time"] >= EVENING_FROM}
 
 
 def fmt_slot(s):
